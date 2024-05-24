@@ -2,10 +2,8 @@
 _*
 .*
 exp_result/
-config/
-models/
 depreciated/
-LA/
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
