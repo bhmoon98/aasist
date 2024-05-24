@@ -24,8 +24,9 @@ from torchcontrib.optim import SWA
 
 from data_utils import (Dataset_1mDFDC_train,
                         Dataset_1mDFDC_devNeval, genSpoof_list)
-from evaluation import calculate_tDCF_EER
+from evaluation_1m import calculate_tDCF_EER
 from utils import create_optimizer, seed_worker, set_seed, str_to_bool
+from tqdm import tqdm
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -54,14 +55,8 @@ def main(args: argparse.Namespace) -> None:
     # define database related paths
     output_dir = Path(args.output_dir)
     prefix_2019 = "1mDFDC.{}".format(track)
-    database_path = Path(config["database_path"])
-    dev_trial_path = (database_path /
-                      "1mDFDC_{}_cm_protocols/{}.cm.dev.trl.txt".format(
-                          track, prefix_2019))
-    eval_trial_path = (
-        database_path /
-        "1mDFDC_{}_cm_protocols/{}.cm.eval.trl.txt".format(
-            track, prefix_2019))
+    database_path = Path(config["database_path"]) # Path to the 1mDFDC database
+    
 
     # define model related paths
     model_tag = "{}_{}_ep{}_bs{}".format(
@@ -71,29 +66,42 @@ def main(args: argparse.Namespace) -> None:
     if args.comment:
         model_tag = model_tag + "_{}".format(args.comment)
     model_tag = output_dir / model_tag
-    model_save_path = model_tag / "weights"
+    model_save_path = "/media/NAS/USERS/moonbo/aasist/weights/{}".format(model_tag)
+    os.makedirs(model_save_path, exist_ok=True)
     eval_score_path = model_tag / config["eval_output"]
     writer = SummaryWriter(model_tag)
-    os.makedirs(model_save_path, exist_ok=True)
     copy(args.config, model_tag / "config.conf")
 
-    # set device
+    # # set device
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Device: {}".format(device))
-    if device == "cpu":
-        raise ValueError("GPU not detected!")
+    # print("Device: {}".format(device))
+    # if device == "cpu":
+    #     raise ValueError("GPU not detected!")
 
     # define model architecture
     model = get_model(model_config, device)
 
+    # Parallelize model across multiple GPUs
+    if torch.cuda.device_count() > 1:
+        print("Using", torch.cuda.device_count(), "GPUs")
+        model = nn.DataParallel(model, device_ids=[0, 1, 2, 3])
+    # model.to(device)
+    print("Device: {}".format(device))
+    if device == "cpu":
+        raise ValueError("GPU not detected!")
+
     # make file list
-    train_files = [], val_files = []
-    # test_files = []
+    train_files = []
+    val_files = []
+    test_files = []
     file_folder = '/media/NAS/DATASET/1mDFDC/filelist/'
     train_file_path = os.path.join(file_folder, 'train_audio.txt')
     val_file_path = os.path.join(file_folder, 'val_audio.txt')
     test_file_path = os.path.join(file_folder, 'test_audio.txt')
-   
+    
+    dev_trial_path = val_file_path
+    eval_trial_path = test_file_path
+
     with open(train_file_path, 'r') as f:
         train_files = f.readlines()
     with open(val_file_path, 'r') as f:
@@ -102,10 +110,6 @@ def main(args: argparse.Namespace) -> None:
         test_files = f.readlines()
     
     trn_loader, dev_loader, eval_loader = get_custom_loader(train_files, val_files, test_files, args.seed, config)
-    
-    # # define dataloaders
-    # trn_loader, dev_loader, eval_loader = get_loader(
-    #     database_path, args.seed, config)
 
     # evaluates pretrained model and exit script
     if args.eval:
@@ -131,7 +135,7 @@ def main(args: argparse.Namespace) -> None:
     optimizer, scheduler = create_optimizer(model.parameters(), optim_config)
     optimizer_swa = SWA(optimizer)
 
-    best_dev_eer = 1.
+    best_dev_eer = 100.
     best_eval_eer = 100.
     best_dev_tdcf = 0.05
     best_eval_tdcf = 1.
@@ -142,16 +146,17 @@ def main(args: argparse.Namespace) -> None:
     # make directory for metric logging
     metric_path = model_tag / "metrics"
     os.makedirs(metric_path, exist_ok=True)
-
+    
     # Training
-    for epoch in range(config["num_epochs"]):
+    for epoch in tqdm(range(config["num_epochs"]), desc="Epochs", total=config["num_epochs"]):
         print("Start training epoch{:03d}".format(epoch))
         running_loss = train_epoch(trn_loader, model, optimizer, device,
                                    scheduler, config)
+        dev_score_format = "dev_score_{}.txt".format(epoch)
         produce_evaluation_file(dev_loader, model, device,
-                                metric_path/"dev_score.txt", dev_trial_path)
+                                metric_path/dev_score_format, dev_trial_path)
         dev_eer, dev_tdcf = calculate_tDCF_EER(
-            cm_scores_file=metric_path/"dev_score.txt",
+            cm_scores_file=metric_path/dev_score_format,
             asv_score_file=database_path/config["asv_score_path"],
             output_file=metric_path/"dev_t-DCF_EER_{}epo.txt".format(epoch),
             printout=False)
@@ -165,33 +170,36 @@ def main(args: argparse.Namespace) -> None:
         if best_dev_eer >= dev_eer:
             print("best model find at epoch", epoch)
             best_dev_eer = dev_eer
-            torch.save(model.state_dict(),
-                       model_save_path / "epoch_{}_{:03.3f}.pth".format(epoch, dev_eer))
+            save_path = os.path.join(model_save_path, "epoch_{}_{:03.3f}.pth".format(epoch, dev_eer))
+            # 모델을 save_path에 저장합니다.
+            torch.save(model.state_dict(), save_path)
+            # torch.save(model.state_dict(),
+            #            model_save_path / "epoch_{}_{:03.3f}.pth".format(epoch, dev_eer))
 
-            # do evaluation whenever best model is renewed
-            if str_to_bool(config["eval_all_best"]):
-                produce_evaluation_file(eval_loader, model, device,
-                                        eval_score_path, eval_trial_path)
-                eval_eer, eval_tdcf = calculate_tDCF_EER(
-                    cm_scores_file=eval_score_path,
-                    asv_score_file=database_path / config["asv_score_path"],
-                    output_file=metric_path /
-                    "t-DCF_EER_{:03d}epo.txt".format(epoch))
+            # # do evaluation whenever best model is renewed
+            # if str_to_bool(config["eval_all_best"]):
+            #     produce_evaluation_file(eval_loader, model, device,
+            #                             eval_score_path, eval_trial_path)
+            #     eval_eer, eval_tdcf = calculate_tDCF_EER(
+            #         cm_scores_file=eval_score_path,
+            #         asv_score_file=database_path / config["asv_score_path"],
+            #         output_file=metric_path /   
+            #         "t-DCF_EER_{:03d}epo.txt".format(epoch))
 
-                log_text = "epoch{:03d}, ".format(epoch)
-                if eval_eer < best_eval_eer:
-                    log_text += "best eer, {:.4f}%".format(eval_eer)
-                    best_eval_eer = eval_eer
-                if eval_tdcf < best_eval_tdcf:
-                    log_text += "best tdcf, {:.4f}".format(eval_tdcf)
-                    best_eval_tdcf = eval_tdcf
-                    torch.save(model.state_dict(),
-                               model_save_path / "best.pth")
-                if len(log_text) > 0:
-                    print(log_text)
-                    f_log.write(log_text + "\n")
+            #     log_text = "epoch{:03d}, ".format(epoch)
+            #     if eval_eer < best_eval_eer:
+            #         log_text += "best eer, {:.4f}%".format(eval_eer)
+            #         best_eval_eer = eval_eer
+            #     if eval_tdcf < best_eval_tdcf:
+            #         log_text += "best tdcf, {:.4f}".format(eval_tdcf)
+            #         best_eval_tdcf = eval_tdcf
+            #         torch.save(model.state_dict(),
+            #                    model_save_path / "best.pth")
+            #     if len(log_text) > 0:
+            #         print(log_text)
+            #         f_log.write(log_text + "\n")
 
-            print("Saving epoch {} for swa".format(epoch))
+            # print("Saving epoch {} for swa".format(epoch))
             optimizer_swa.update_swa()
             n_swa_update += 1
         writer.add_scalar("best_dev_eer", best_dev_eer, epoch)
@@ -203,7 +211,7 @@ def main(args: argparse.Namespace) -> None:
         optimizer_swa.swap_swa_sgd()
         optimizer_swa.bn_update(trn_loader, model, device=device)
     produce_evaluation_file(eval_loader, model, device, eval_score_path,
-                            eval_trial_path)
+                            eval_trial_path, eval=True)
     eval_eer, eval_tdcf = calculate_tDCF_EER(cm_scores_file=eval_score_path,
                                              asv_score_file=database_path /
                                              config["asv_score_path"],
@@ -213,15 +221,19 @@ def main(args: argparse.Namespace) -> None:
     f_log.write("EER: {:.3f}, min t-DCF: {:.5f}".format(eval_eer, eval_tdcf))
     f_log.close()
 
-    torch.save(model.state_dict(),
-               model_save_path / "swa.pth")
+    save_path = os.path.join(model_save_path, "swa.pth")
+    torch.save(model.state_dict(), save_path)
+    # torch.save(model.state_dict(),
+    #            model_save_path / "swa.pth")
 
     if eval_eer <= best_eval_eer:
         best_eval_eer = eval_eer
     if eval_tdcf <= best_eval_tdcf:
         best_eval_tdcf = eval_tdcf
-        torch.save(model.state_dict(),
-                   model_save_path / "best.pth")
+        save_path = os.path.join(model_save_path, "best.pth")
+        torch.save(model.state_dict(), save_path)
+        # torch.save(model.state_dict(),
+        #            model_save_path / "best.pth")
     print("Exp FIN. EER: {:.3f}, min t-DCF: {:.5f}".format(
         best_eval_eer, best_eval_tdcf))
 
@@ -265,8 +277,7 @@ def get_custom_loader(
                             drop_last=False,
                             pin_memory=True)
 
-    eval_set = Dataset_1mDFDC_devNeval(list_IDs=test_files,
-                                       base_dir=eval_database_path)
+    eval_set = Dataset_1mDFDC_devNeval(list_IDs=test_files)
     eval_loader = DataLoader(eval_set,
                              batch_size=config["batch_size"],
                              shuffle=False,
@@ -274,88 +285,22 @@ def get_custom_loader(
                              pin_memory=True)
 
     return trn_loader, dev_loader, eval_loader
-
-def get_loader(
-        database_path: str,
-        seed: int,
-        config: dict) -> List[torch.utils.data.DataLoader]:
-    """Make PyTorch DataLoaders for train / developement / evaluation"""
-    track = config["track"]
-    prefix_2019 = "1mDFDC.{}".format(track)
-
-    trn_database_path = database_path / "1mDFDC_{}_train/".format(track)
-    dev_database_path = database_path / "1mDFDC_{}_dev/".format(track)
-    eval_database_path = database_path / "1mDFDC_{}_eval/".format(track)
-
-    trn_list_path = (database_path /
-                     "1mDFDC_{}_cm_protocols/{}.cm.train.trn.txt".format(
-                         track, prefix_2019))
-    dev_trial_path = (database_path /
-                      "1mDFDC_{}_cm_protocols/{}.cm.dev.trl.txt".format(
-                          track, prefix_2019))
-    eval_trial_path = (
-        database_path /
-        "1mDFDC_{}_cm_protocols/{}.cm.eval.trl.txt".format(
-            track, prefix_2019))
-
-    d_label_trn, file_train = genSpoof_list(dir_meta=trn_list_path,
-                                            is_train=True,
-                                            is_eval=False)
-    print("no. training files:", len(file_train))
-
-    train_set = Dataset_1mDFDC_train(list_IDs=file_train,
-                                           labels=d_label_trn,
-                                           base_dir=trn_database_path)
-    gen = torch.Generator()
-    gen.manual_seed(seed)
-    trn_loader = DataLoader(train_set,
-                            batch_size=config["batch_size"],
-                            shuffle=True,
-                            drop_last=True,
-                            pin_memory=True,
-                            worker_init_fn=seed_worker,
-                            generator=gen)
-
-    _, file_dev = genSpoof_list(dir_meta=dev_trial_path,
-                                is_train=False,
-                                is_eval=False)
-    print("no. validation files:", len(file_dev))
-
-    dev_set = Dataset_1mDFDC_devNeval(list_IDs=file_dev,
-                                            base_dir=dev_database_path)
-    dev_loader = DataLoader(dev_set,
-                            batch_size=config["batch_size"],
-                            shuffle=False,
-                            drop_last=False,
-                            pin_memory=True)
-
-    file_eval = genSpoof_list(dir_meta=eval_trial_path,
-                              is_train=False,
-                              is_eval=True)
-    eval_set = Dataset_1mDFDC_devNeval(list_IDs=file_eval,
-                                             base_dir=eval_database_path)
-    eval_loader = DataLoader(eval_set,
-                             batch_size=config["batch_size"],
-                             shuffle=False,
-                             drop_last=False,
-                             pin_memory=True)
-
-    return trn_loader, dev_loader, eval_loader
-
 
 def produce_evaluation_file(
     data_loader: DataLoader,
     model,
     device: torch.device,
     save_path: str,
-    trial_path: str) -> None:
+    trial_path: str,
+    eval: bool=False) -> None:
     """Perform evaluation and save the score to a file"""
     model.eval()
     with open(trial_path, "r") as f_trl:
         trial_lines = f_trl.readlines()
     fname_list = []
     score_list = []
-    for batch_x, utt_id in data_loader:
+    
+    for batch_x, utt_id in tqdm(data_loader, desc="Evaluation Batches", leave=False, total=len(data_loader)):
         batch_x = batch_x.to(device)
         with torch.no_grad():
             _, batch_out = model(batch_x)
@@ -365,11 +310,19 @@ def produce_evaluation_file(
         score_list.extend(batch_score.tolist())
 
     assert len(trial_lines) == len(fname_list) == len(score_list)
-    with open(save_path, "w") as fh:
-        for fn, sco, trl in zip(fname_list, score_list, trial_lines):
-            _, utt_id, _, src, key = trl.strip().split(' ')
-            assert fn == utt_id
-            fh.write("{} {} {} {}\n".format(utt_id, src, key, sco))
+    if not eval:
+        with open(save_path, "w") as fh:
+            for fn, sco, trl in zip(fname_list, score_list, trial_lines):
+                fname = os.path.splitext(os.path.basename(trl))[0]
+                assert fn == fname
+                src = 1 if "real" in fname else 0
+                key = src
+                fh.write("{} {} {} {}\n".format(fn, src, key, sco))
+    else:
+        with open(save_path, "w") as fh:
+            for fn, sco, trl in zip(fname_list, score_list, trial_lines):
+                fname = os.path.basename(trl) # 확장자 까지 표시
+                fh.write("{};{}\n".format(fn, sco))
     print("Scores saved to {}".format(save_path))
 
 
@@ -389,7 +342,7 @@ def train_epoch(
     # set objective (Loss) functions
     weight = torch.FloatTensor([0.1, 0.9]).to(device)
     criterion = nn.CrossEntropyLoss(weight=weight)
-    for batch_x, batch_y in trn_loader:
+    for batch_x, batch_y in tqdm(trn_loader, desc="Training Batches", leave=False, total=len(trn_loader)):
         batch_size = batch_x.size(0)
         num_total += batch_size
         ii += 1

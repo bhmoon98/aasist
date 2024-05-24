@@ -3,6 +3,7 @@ import soundfile as sf
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
+import os
 
 ___author__ = "Hemlata Tak, Jee-weon Jung"
 __email__ = "tak@eurecom.fr, jeeweon.jung@navercorp.com"
@@ -94,6 +95,45 @@ class Dataset_ASVspoof2019_devNeval(Dataset):
     def __getitem__(self, index):
         key = self.list_IDs[index]
         X, _ = sf.read(str(self.base_dir / f"flac/{key}.flac"))
+        X_pad = pad(X, self.cut)
+        x_inp = Tensor(X_pad)
+        return x_inp, key
+
+class Dataset_1mDFDC_train(Dataset):
+    def __init__(self, list_IDs):
+        """self.list_IDs	: list of strings (each string: utt key),
+           self.labels      : dictionary (key: utt key, value: label integer)"""
+        self.path = [x.strip() for x in list_IDs]
+        self.list_IDs = [os.path.splitext(os.path.basename(x))[0] for x in list_IDs]
+        self.labels = {id: 1 if "real" in id else 0 for id in self.list_IDs}
+        self.cut = 64600  # take ~4 sec audio (64600 samples)
+
+    def __len__(self):
+        return len(self.list_IDs)
+
+    def __getitem__(self, index):
+        key = self.list_IDs[index]
+        X, _ = sf.read(str(self.path[index]))
+        X_pad = pad_random(X, self.cut)
+        x_inp = Tensor(X_pad)
+        y = self.labels[key]
+        return x_inp, y
+
+
+class Dataset_1mDFDC_devNeval(Dataset):
+    def __init__(self, list_IDs):
+        """self.list_IDs	: list of strings (each string: utt key),
+        """
+        self.path = [x.strip() for x in list_IDs]
+        self.list_IDs = [os.path.splitext(os.path.basename(x))[0] for x in list_IDs]
+        self.cut = 64600  # take ~4 sec audio (64600 samples)
+
+    def __len__(self):
+        return len(self.list_IDs)
+
+    def __getitem__(self, index):
+        key = self.list_IDs[index]
+        X, _ = sf.read(str(self.path[index]))
         X_pad = pad(X, self.cut)
         x_inp = Tensor(X_pad)
         return x_inp, key
