@@ -325,6 +325,37 @@ def produce_evaluation_file(
                 fh.write("{};{}\n".format(fn, sco))
     print("Scores saved to {}".format(save_path))
 
+def produce_evaluation_file_inference(
+    data_loader: DataLoader,
+    model,
+    device: torch.device,
+    save_path: str,
+    trial_path: str) -> None:
+    """Perform evaluation and save the score to a file"""
+    model.eval()
+    with open(trial_path, "r") as f_trl:
+        trial_lines = f_trl.readlines()
+    fname_list = []
+    score_list0 = []
+    score_list1 = []
+    
+    for batch_x, utt_id in tqdm(data_loader, desc="Evaluation Batches", leave=False, total=len(data_loader)):
+        batch_x = batch_x.to(device)
+        with torch.no_grad():
+            _, batch_out = model(batch_x)
+            batch_score0 = (batch_out[:, 0]).data.cpu().numpy().ravel()
+            batch_score1 = (batch_out[:, 1]).data.cpu().numpy().ravel()
+        # add outputs
+        fname_list.extend(utt_id)
+        score_list0.extend(batch_score0.tolist())
+        score_list1.extend(batch_score1.tolist())
+
+    assert len(trial_lines) == len(fname_list) == len(score_list0) == len(score_list1)
+    with open(save_path, "w") as fh:
+        for fn, sco0, sco1 in zip(fname_list, score_list0, score_list1):
+            fh.write("{} {} {}\n".format(fn, sco0, sco1))
+    print("Scores saved to {}".format(save_path))
+
 
 def train_epoch(
     trn_loader: DataLoader,
